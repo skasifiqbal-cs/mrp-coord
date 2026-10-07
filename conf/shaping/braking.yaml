@@ -1,0 +1,9 @@
+# @package shaping
+# Braking-aware potential: phi = -T(d_grid, |v|), the bang-bang minimum time to cover
+# the obstacle-free geodesic distance from the current speed and STOP at the goal.
+# Same cost map as shaping=dijkstra, but time-to-go under the acceleration bound
+# instead of d/v_max. Requires a second-order robot (needs a_max).
+type: braking
+gamma: 1.0
+cell_size: 0.1
+clearance_margin: 0.05

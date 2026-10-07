@@ -1,0 +1,30 @@
+type: unicycle2
+# Second-order unicycle, parameters taken VERBATIM from the dynobench benchmark model
+#   https://github.com/quimortiz/dynobench  models/unicycle2_v0.yaml
+# referenced by db-CBS scenario files as `type: unicycle_second_order_0`.
+# Unlike conf/robot/unicycle_v2.yaml (our own tuning) these are the published values,
+# so results on db-CBS instances are comparable to the literature.
+v_max: 0.5
+v_min: -0.5          # benchmark robot CAN reverse (ours is forward-only)
+omega_max: 0.5
+omega_min: -0.5
+a_max: 0.25          # max_acc_abs
+alpha_max: 0.25      # max_angular_acc
+# Consequences of the published limits:
+#   braking distance d_brake = v_max^2 / (2*a_max) = 0.25 / 0.5 = 0.50 m
+#   turning radius   rho     = v_max / omega_max  = 1.00 m
+# d_brake is 2x our goal_radius (0.25 m) -> rho_brake = d_brake/goal_radius = 2.0,
+# i.e. the benchmark robot sits well inside the "must brake early" regime.
+# KNOWN DEVIATIONS from dynobench, verified against src/unicycle2.cpp:
+#   integrator - db-CBS integrates with EULER ("dt sufficiently small to ensure that the
+#                Euler integration holds"); Unicycle2Model uses RK4. RK4 is strictly more
+#                accurate, so trajectories will not be bit-comparable with published runs.
+#   v/omega    - dynobench declares these as solver state bounds (x_lb/x_ub); our env
+#                CLIPS after integration, so a policy can ride the bound differently.
+# The vector field itself matches exactly: f = [v*cos(yaw), v*sin(yaw), w, a, w_dot],
+# state ordering [x, y, yaw, v, w], and size(0) is the x-extent (dynobench builds
+# fcl::Boxd(size(0), size(1), 1.0)).
+shape:
+  type: box
+  width: 0.5         # extent along local x (forward)  <- dynobench size[0]
+  length: 0.25       # extent along local y (lateral)  <- dynobench size[1]

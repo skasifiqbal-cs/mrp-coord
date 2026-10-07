@@ -1,0 +1,42 @@
+--- a/src/robots.cpp
++++ b/src/robots.cpp
+@@ -335,9 +335,13 @@
+     {
+       float dt = std::min(remaining_time, dt_);
+ 
+-      x += ctrl[0] * cosf(yaw) * dt;
+-      y += ctrl[0] * sinf(yaw) * dt;
+-      yaw += ctrl[1] * dt;
++      // RK4, as in the simulator's Unicycle1Model.step (the simulator that scores plans).
++      float v = std::min(std::max((float)ctrl[0], -0.5f), 0.5f);
++      float w = std::min(std::max((float)ctrl[1], -0.5f), 0.5f);
++      float t1 = yaw, t2 = yaw + 0.5f * dt * w, t4 = yaw + dt * w;
++      x += dt / 6.0f * v * (cosf(t1) + 4.0f * cosf(t2) + cosf(t4));
++      y += dt / 6.0f * v * (sinf(t1) + 4.0f * sinf(t2) + sinf(t4));
++      yaw += w * dt;
+ 
+       remaining_time -= dt;
+     } while (remaining_time >= dt_);
+@@ -535,11 +539,17 @@
+     {
+       float dt = std::min(remaining_time, dt_);
+ 
+-      x += v * cosf(yaw) * dt;
+-      y += v * sinf(yaw) * dt;
+-      yaw += w * dt;
+-      v += ctrl[0] * dt;
+-      w += ctrl[1] * dt;
++      // RK4 with v, w saturated after the step, as in the simulator's Unicycle2Model.step.
++      float a = std::min(std::max((float)ctrl[0], -0.25f), 0.25f);
++      float al = std::min(std::max((float)ctrl[1], -0.25f), 0.25f);
++      float h = 0.5f * dt;
++      float v2 = v + h * a, w2 = w + h * al, v4 = v + dt * a, w4 = w + dt * al;
++      float th2 = yaw + h * w, th3 = yaw + h * w2, th4 = yaw + dt * w2;
++      x += dt / 6.0f * (v * cosf(yaw) + 2.0f * v2 * cosf(th2) + 2.0f * v2 * cosf(th3) + v4 * cosf(th4));
++      y += dt / 6.0f * (v * sinf(yaw) + 2.0f * v2 * sinf(th2) + 2.0f * v2 * sinf(th3) + v4 * sinf(th4));
++      yaw += dt / 6.0f * (w + 4.0f * w2 + w4);
++      v = std::min(std::max(v4, -0.5f), 0.5f);
++      w = std::min(std::max(w4, -0.5f), 0.5f);
+ 
+       remaining_time -= dt;
+     } while (remaining_time >= dt_);

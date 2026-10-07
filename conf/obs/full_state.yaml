@@ -1,0 +1,5 @@
+# @package obs
+type: full_state
+# obs = [own(4), goal(4), other_agents(2×N-1), obstacles(6×n_obs)]
+# Obstacle encoding: [rel_x, rel_y, hw, hl, sin(angle), cos(angle)]
+# Circles: hw=hl=radius, angle=0

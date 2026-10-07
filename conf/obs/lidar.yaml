@@ -1,0 +1,5 @@
+# @package obs
+type: lidar
+num_rays: 16
+max_range: 5.0
+# obs = [own(4), goal(4), lidar_ranges(num_rays)] — ranges normalised to [0,1]

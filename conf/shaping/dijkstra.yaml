@@ -1,0 +1,8 @@
+# @package shaping
+# Obstacle-aware dense potential: φ = -d_grid/v_max, d_grid = 8-connected Dijkstra
+# shortest-path distance to the goal over the obstacle-free (inflated) grid.
+# Routes AROUND obstacles, so the gradient never points through a wall.
+type: dijkstra
+gamma: 1.0            # undiscounted progress shaping (F = φ(s')-φ(s)); idle -> 0
+cell_size: 0.1       # grid resolution [m]
+clearance_margin: 0.05  # extra inflation beyond robot radius [m]

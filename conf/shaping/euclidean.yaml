@@ -1,0 +1,3 @@
+# @package shaping
+type: euclidean
+gamma: 1.0   # undiscounted: F=phi(s)-phi(s) -> reward for PROGRESS, idle=0 (avoids discount-bleed idle reward)

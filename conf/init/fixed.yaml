@@ -1,0 +1,3 @@
+# @package init
+type: fixed
+# Use exact start/goal from env yaml every episode

@@ -1,0 +1,428 @@
+# @package _global_
+# Planning approach: solve with a classical / kinodynamic planner instead of RL.
+# No training, no checkpoint — controls are computed online over the same env.
+#
+#   python main.py approach=planning approach.method=karc
+#   python evaluate.py approach=planning approach.method=optimization eval.episodes=50
+#
+# Everything a planning run depends on lives under `approach:` below, so
+# `python main.py approach=planning --cfg job` shows the full experiment.
+approach:
+  type: planning
+  # karc        = the faithful arXiv:2501.01559 reimplementation (the BASELINE)
+  # constructive = ours: constructed coordination + complete scheduling
+  method: cegar   # cegar (K-REF) | karc (K-ARC) | kcbs (K-CBS)
+
+  # ── Shared nonlinear-program settings ───────────────────────────────────────
+  # Read by every optimisation-based method (`optimization`, `karc`), so the
+  # solver behaves identically across them and only the coordination differs.
+  trajopt:
+    # Bodies in the AVOIDANCE constraint. 1 = a single circumscribed disc, which for a
+    # 0.5 x 0.25 robot demands 0.609 m of centre separation where two axis-aligned bodies
+    # physically need 0.300 m -- 2.03x too conservative, and OUR approximation, not the
+    # paper's (SS V-A: "simple polyhedrons ... shortest distances between any two objects").
+    # It is load-bearing: at the 1.0 m row spacing of N=32 it leaves 0.391 m between two
+    # ADJACENT rows that both need to veer, against the 0.609 m it demands, so no two
+    # neighbouring rows can pass at the same time and every resolution invalidates its
+    # neighbours'. k discs of radius hypot(L/2k, W/2) cover the body exactly and stay smooth
+    # for IPOPT: k=2 gives 0.404 m, k=3 gives 0.350 m. Cost is k^2 constraints per pair.
+    body_discs: 1
+    solver: ipopt      # CasADi + IPOPT — pip install -e ".[planning]"
+    # Time budget. horizon * env.dt is the trajectory duration the program may
+    # use, so a hardcoded value silently goes infeasible when dt or the robot
+    # changes. null derives it from the bang-bang traverse time; `slack` is the
+    # multiplier over that straight-line optimum, leaving room for detours.
+    horizon: null
+    slack: 1.5
+    # Objective is  effort_weight * sum||u||^2 + T.  Larger = smoother, slower.
+    effort_weight: 0.01
+    goal_tol: 0.2      # metres; keep <= env.goal_radius
+    # Separation margin added to every clearance constraint. Not cosmetic:
+    # minimising time drives the solution onto the constraint boundary, and a
+    # trajectory clearing an obstacle by millimetres at the knots overlaps it
+    # once execution drifts off them.
+    clearance: 0.05
+    max_iters: 500
+    # Only obstacles within this distance of the segment's kinematic guide get a constraint.
+    # Every knot otherwise carries one nonlinear constraint per obstacle, which in a
+    # cluttered scene is most of the program and nearly all of it redundant. null = keep all
+    # of them, which is what an empty world does anyway. DEVIATION: a heuristic, not a
+    # reachability bound -- a detour wider than this cannot see what is out there, so keep it
+    # wider than any manoeuvre the ladder should be allowed to find.
+    obstacle_margin: 4.0
+    # dt is a DECISION VARIABLE when free (true minimum time, K-ARC's objective).
+    #
+    # The LOWER bound must not go below the env's step. K-ARC never executes, so any Delta t
+    # is fine for it; we do, and a segment solved at spacing finer than env.dt cannot be
+    # represented on the grid it is executed from. `_min_time_horizon` converts the free
+    # solution to a whole number of env steps, so Delta t* < env.dt silently DISCARDS knots
+    # -- at the old floor of 0.02 against env.dt=0.1, up to five out of every six. The
+    # segment then has to thread the same obstacles at five times the spacing, which is
+    # feasible in open space and not under clutter: cluttered_cross_8 succeeds with
+    # min_time=false (766 steps) and exhausts the 600s budget with it on.
+    #
+    # At a floor of env.dt the conversion can only ever ADD knots, never drop them, and the
+    # objective is untouched -- the solver still minimises N*dt freely above the floor.
+    # 0.1 is env.dt for every unicycle2 scenario here; raise both if the env steps slower.
+    dt_bounds: [0.02, 0.5]
+
+  # ── K-ARC (arXiv:2501.01559) ────────────────────────────────────────────────
+  karc:
+    # Where the INITIAL kinematic paths come from (Alg. 1 line 3). K-ARC uses "any kinematic
+    # sampling-based method" (§IV-A) and Fig. 1(a) shows a per-robot roadmap; these paths are
+    # guidance only -- "not used as the final solutions but rather as guidance for the
+    # kinodynamic solutions".
+    #   rrt      - geometric RRT in (x, y), no dynamics (src/planning/geometric_rrt.py).
+    #              Sampling-based, so a run is only reproducible per rrt_seed -- which is also
+    #              where the paper's trial-to-trial variance comes from.
+    #   dijkstra - greedy descent on the clearance-inflated Dijkstra grid used by the shaping
+    #              potentials. Deterministic and near-shortest, so the optimizer is handed an
+    #              easier path than a sampling planner would give it. NOT K-ARC; kept for the
+    #              ablation and as a deterministic regression baseline. Also the only option
+    #              that works if a scenario defeats the RRT (fallbacks are counted in
+    #              `initial_path_fallbacks`, never silent).
+    initial_paths: rrt
+    initial_rrt_iters: 5000
+    initial_rrt_step: 0.6
+    initial_rrt_goal_bias: 0.1
+    # Keep the sampling planner's raw path (false) or shortcut it first (true).
+    #
+    # TRUE is the faithful choice, and the earlier comment here had it backwards. K-ARC's
+    # Fig. 1(a) says "each robot builds their individual ROADMAP", and SS II-A separates "a
+    # roadmap [10]" (PRM, Kavraki et al.) from "a tree [11]" (RRT, LaValle & Kuffner) -- so
+    # their initial paths are PRM, which in open space returns essentially the chord. A RAW
+    # RRT path is nothing like that: RRT explores by extending toward random samples, so its
+    # path inherits every meander of the tree. Post-processing it is universal practice, not
+    # an embellishment (Geraerts & Overmars, IJRR 26(8):845-863, 2007; Hauser &
+    # Ng-Thow-Hing, ICRA 2010 pp. 2493-2498; OMPL's PathSimplifier, whose own docs note that
+    # sampling-based planners "produce solutions that contain many unnecessary waypoints and
+    # inefficient routes"). Ours only drops vertices the RRT already produced.
+    #
+    # On open_cross_16 the raw guides averaged 1.25x chord over 33 vertices and wandered
+    # 3.16 m off-row against a 2.14 m row spacing -- so they routed each robot through one to
+    # two NEIGHBOURING lanes and manufactured the conflicts. The cost was not marginal:
+    #   raw       1800 s, FAILED, merges=10, subproblem_max=10, conflicts_remaining=9
+    #   shortcut    52 s, solved, merges=0,  subproblem_max=2,  rungs={'prioritized': 9}
+    # Shortcutting collapses the guide to 1.00x chord and 2 vertices -- the PRM answer.
+    initial_rrt_shortcut: true
+    # Size each segment by SOLVING for it with Delta t free (K-ARC Eq. 2, §IV-B: "we can
+    # instead minimize DeltaT and set it as a decision variable"), then convert the minimum
+    # duration to a whole number of env steps and plan the segment there.
+    #
+    # Without this the objective is gone, not approximated: with dt pinned to the env grid
+    # and N fixed, `N * dt` is a constant, so the program minimises effort alone -- and effort
+    # is minimised by spreading motion thinly over the whole horizon. The segment then takes
+    # exactly as long as the horizon it was handed, and that horizon came from the guide, so
+    # a wandering guide is spent rather than optimised away.
+    #
+    # Costs one extra single-robot solve per robot per segment (counted in min_time_solves).
+    # false reproduces the guide-length sizing used before 2026-09-08.
+    min_time: true
+    # Process pool for the per-robot solves that Alg. 1 lines 15-19 and the min-time probes
+    # perform. Those are independent by construction -- each robot is solved with no
+    # knowledge of the others, which is precisely why a conflict-resolution stage follows --
+    # so solving them one at a time is a property of THIS implementation, not of K-ARC, whose
+    # experiments ran on a 32-core i9-14900K (§V-A). Results are identical either way; only
+    # wall time changes, and the pool cannot reorder or alter a plan.
+    #   0 or 1 - serial (default; reproduces every run before 2026-09-08)
+    #   N      - pool of N workers
+    #   -1     - one worker per core
+    # Threads are useless here: CasADi holds the GIL through a solve, measured at 0.65x on
+    # 8 threads (slower than serial) against 4.11x on 8 processes.
+    workers: 0
+    # Number of equal segments the reference path is split into (K-ARC's `m`).
+    # Segmentation synchronises milestones so robots share a time grid, which is
+    # what makes the inter-robot constraints meaningful. The paper does not publish
+    # its value, and results are SENSITIVE to it -- measured on the three 2-robot
+    # scenarios in the repo at the time (swap2 / crossing_2agent / gap), m=1 and m=4
+    # solved all three while m=2, 3 and 6 each failed at least one. crossing_2agent has
+    # since been deleted as a near-duplicate of gap, so re-sweep before quoting this. No m produced a collision, so the cost of a bad m is a robot
+    # that stops short, not one that crashes. Sweep it before reporting anything.
+    m_segments: 4
+    # How a subproblem's robot set R' is chosen when a segment has several conflicts.
+    #   pair    - one subproblem per conflicting PAIR, which is what ARC specifies
+    #             (arXiv:2312.08554 SS IV-B, "R' = R_i u R_j merges the involved robots").
+    #             R' then grows only reactively, when resolving one conflict invalidates a
+    #             resolution already made this round.
+    #   merged  - every conflicting robot in the segment in ONE subproblem. What this
+    #             implementation did before 2026-09-07; kept for the ablation, since it is
+    #             the difference between 16 independent pair solves and one 32-robot solve.
+    subproblem: pair
+    # Eq. 6 constrains ||c_i,k - c_j,k|| where c is the robot's GEOMETRIC POSE, and SS V-A:
+    # "we use simple polyhedrons for both our obstacle and robot models, and we calculate
+    # the shortest distances between any two objects".
+    #   polyhedral   - exact surface-to-surface distance (faithful)
+    #   circumscribed - centre distance vs summed bounding radii (what we did before
+    #                   2026-09-08; for a 0.5x0.25 box that invents up to 0.3 m of phantom
+    #                   proximity per pair and manufactures conflicts K-ARC never sees)
+    robot_distance: polyhedral
+    # K-ARC never executes a trajectory -- Alg. 1 returns "a set of valid, kinodynamically
+    # feasible paths" and SS V-D scores runtime, path cost and success on the PLAN.
+    #   false - faithful. Each segment is solved on one shared FREE timestep (the slowest
+    #           robot's minimum, SS IV-D-2's "waiting states for robots that arrive first"),
+    #           knot count preserved, no env grid anywhere. The plan is then validated
+    #           directly against Eq. 5 and Eq. 6 (`_check_plan`).
+    #   true  - re-lands the plan on env.dt so it can be rolled out. Needed to share a
+    #           metric with the RL side; costs knots whenever dt* < env.dt.
+    execute: false
+    # Headroom on the minimum-time segment duration. The per-robot minimum-time probe is
+    # UNCONSTRAINED by the other robots, and coordination can only lengthen a segment, so
+    # the probe's answer is a strict lower bound. 1.0 sizes segments at that bound and they
+    # fail; the execution path used to get this slack for free from rounding up to whole
+    # env steps.
+    min_time_slack: 1.5
+    # Radius of the INTERMEDIATE milestone region (Alg. 1 line 16: "g_j is a region centered
+    # around G_ri[j]"; SS IV-C: "to make sure the local subproblem is solvable, we define a
+    # tolerance for the goal state"). The final goal keeps the env's own goal_radius, since
+    # that is what success actually means. Null falls back to trajopt.goal_tol, which makes
+    # every milestone as strict as the real goal -- not what the paper describes.
+    milestone_region: 0.6
+    # A robot whose own segment is infeasible but which conflicts with nobody. Alg. 1 line 21
+    # builds subproblems from the conflict set alone; SS IV-C absorbs the individually-hard
+    # case through the goal REGION instead ("we define a tolerance for the goal state").
+    # Ours, and off by default.
+    singleton_subproblems: false
+    # Pull apart milestones that land on the same point. Nowhere in K-ARC; an artefact of
+    # deriving every reference from one shared Dijkstra field. Ours, off by default.
+    separate_milestones: false
+    # Conflict predicate: robots closer than d_min at the same index conflict.
+    # null -> sum of the two bounding radii + trajopt.clearance. This is a purely
+    # GEOMETRIC test with no velocity term, faithful to K-ARC Eq. 6.
+    d_min: null
+    # Resolution ladder. Each rung is tried in order on a failed subproblem; drop one
+    # to ablate its contribution.
+    # The default is K-ARC's own hierarchy (SS III-C): prioritized trajectory optimisation,
+    # then Decoupled Kinodynamic RRT, then Composite Kinodynamic RRT. The last two exist
+    # because the first cannot change homotopy class -- a prioritised re-solve can only make
+    # a robot slow down or stop, never route it the other way round an obstacle -- so a
+    # ladder of trajopt-only rungs is not K-ARC's ladder, whatever else it can do.
+    #   prioritized    - re-solve the conflicting robots one at a time, each avoiding the
+    #                    trajectories already fixed this round. Cheapest.
+    #   decoupled_rrt  - same ordering, but each robot gets a kinodynamic RRT (time-gridded,
+    #                    see src/planning/krrt.py) instead of a nonlinear program.
+    #   composite_rrt  - ONE tree over the joint state of R'. Complete for the subproblem in
+    #                    the limit, exponential in |R'|; last for that reason.
+    # NOT K-ARC, kept for ablation and available by naming them here:
+    #   relaxed_goal   - prioritized, but lower-priority robots get a looser terminal
+    #                    tolerance (relax_per_level), so they stop short rather than fail.
+    #   joint          - the conflicting robots in ONE nonlinear program so both can yield.
+    #                    Solves a symmetric head-on swap that no ordering can; the
+    #                    optimisation-side counterpart of composite_rrt.
+    #   wait           - resolve by SCHEDULE alone: one robot brakes to rest, holds until
+    #                    the other has passed, then runs its segment in the time left. The
+    #                    smallest intervention there is -- one scalar, the delay -- and the
+    #                    one K-ARC's ladder has no rung for. Not the timestep insertion of
+    #                    kinematic MAPF: a second-order robot cannot be time-shifted, so the
+    #                    delay is only admissible if braking and re-accelerating fit inside
+    #                    its acceleration bounds and the segment's remaining steps.
+    #   guide_repair   - re-plan the GUIDE (2-D geometric RRT) of each lower-priority robot
+    #                    around the corridor swept by the robots already fixed in this
+    #                    subproblem, then re-solve kinodynamically along it. Changes homotopy
+    #                    class -- which prioritized cannot -- at 2-D cost rather than
+    #                    composite_rrt's joint-state cost. Only the subproblem's own robots
+    #                    block the guide; everyone else is still avoided by the solve, since
+    #                    flattening every trajectory into a static wall makes the workspace
+    #                    impassable at N=32.
+    ladder: [prioritized, decoupled_rrt, composite_rrt]
+
+    group_offset: 0      # env steps between manoeuvre groups; 0 = derived
+    lead: 5.5            # metres run straight before the veer begins
+    span: 2.0            # metres held at the veered offset across the crossing
+    # Sampling-rung knobs, shared by both RRT rungs.
+    rrt_seed: 0          # tree growth is randomised, so a run is only reproducible per-seed.
+    rrt_iters: 3000      # extension attempts before giving up and failing the rung.
+    # DEVIATION: wall-clock cap per RRT call (s), also clipped to the planning deadline. The
+    # Python composite tree is far slower per sample than K-ARC's C++; uncapped, one 4-robot
+    # tree took 344 s of a 600 s budget and starved AdaptSubProblem.
+    rrt_time_limit: 30.0
+    # Slot assignment for the `wait` rung. NOVELTY -- not K-ARC. Subproblems that compete
+    # for the same space get different colours, so their resolutions do not all happen at
+    # once. On open_cross_32, 19 of 19 conflicts are individually resolvable by waiting and
+    # the plan still fails: pairwise resolvability is not joint resolvability, and K-ARC's
+    # per-pair decomposition cannot see the difference.
+    # Robots are not manufactured identical, and Open Cross assumes they are: identical
+    # bodies, evenly spaced identical rows, simultaneous starts. Every subproblem then finds
+    # the same locally-cheapest resolution and they all bid for the same space at the same
+    # instant -- which is why 19 of 19 conflicts at N=32 are individually resolvable and none
+    # of them jointly. `detune` scales each robot's acceleration bounds by a factor drawn
+    # once from [1-detune, 1]. DOWNWARD only, so a plan stays executable on the real robot.
+    # 0.0 is the faithful K-ARC baseline: exactly homogeneous.
+    detune: 0.0
+    # Directed speed assignment (NOVELTY -- not K-ARC). Random detuning makes robots differ
+    # but not the RIGHT ones; a conflict needs an ORIENTATION -- one of the pair goes first.
+    # Orient every conflict, and consistency is exactly acyclicity of the directed conflict
+    # graph; robots on a cycle admit no speed assignment and are handed to the ladder.
+    # Rank comes from a topological order, speed from rank, DOWNWARD only.
+    speed_assignment: false
+    speed_step: 0.15     # authority given up per rank.
+    # HOW rank is spent. `offset` leaves every bound alone and buys a later START, so the
+    # optimizer keeps full authority to meet it -- the per-robot objective (N*dt + effort,
+    # trajopt.py) rewards going flat out, so a robot never staggers on its own however much
+    # room it has; the schedule is what has to change, not the capability. `clamp` scales
+    # the bounds instead, which removes the authority to dodge as well, and is kept only as
+    # the ablation arm showing why that is the wrong lever.
+    speed_mode: offset   # offset | clamp
+    # HOW rank is derived. `colour` separates: conflicting robots get different ranks, using
+    # the fewest ranks that achieves it, so no robot is asked for a long delay. `chain`
+    # ORDERS instead (topological rank over "who reaches the crossing first"), and is kept
+    # only as the ablation showing why ordering is the wrong structure here: Open Cross is
+    # exactly symmetric, so every tie breaks by robot index, the order runs deep enough that
+    # 25 of 32 robots hit `speed_floor`, and the resulting collapse hands 38 conflicting
+    # PAIRS the same rank -- destroying the very separation the offsets depend on.
+    speed_rank: colour   # colour | chain
+    colour_restarts: 8   # random greedy orders tried; the fewest-rank colouring wins.
+    offset_steps: 8      # env steps of delay per rank, in `offset` mode.
+    speed_floor: 0.5     # never below half, however deep the order gets.
+    slot_reach: 1.0      # metres of borrowed space a resolution is assumed to need.
+    slot_steps: 8        # extra wait per colour, in env steps.
+    repair_rrt_iters: 2000   # guide_repair's 2-D RRT; cheaper per sample than the above.
+    repair_stride: 0.25      # corridor blockers are deduped by ARCLENGTH, metres.
+    rrt_controls: 10     # controls sampled per extension; the best is kept (best-input RRT).
+    rrt_steps: 5         # env.dt steps one control is held for. MUST divide the segment
+                         # horizon's grid -- node depth is the timestep index, which is what
+                         # keeps an RRT trajectory comparable with a trajopt one.
+    rrt_goal_bias: 0.15  # probability of expanding the goal-closest node instead of a random one.
+    # AdaptSubProblem (Alg. 2 line 10). When the WHOLE solver hierarchy fails on a window,
+    # widen it and run the hierarchy again. K-ARC §III-C: "we adapt the subproblem by
+    # setting the start query to the robot's previous segment start and the goal query to
+    # its next segment goal ... as opposed to in ARC where the queries are obtained by small
+    # incremental expansions". This is how many segments BACK the start query may move; 1 is
+    # K-ARC's "previous segment". 0 disables adaptation, which is what this implementation
+    # did before 2026-09-07 -- and without it max_rounds re-solves a near-identical problem,
+    # since nothing about the window has changed between rounds.
+    #
+    # Both halves are applied, to every robot at once, and the widened window consumes the
+    # segments it reaches into. Backward-only (before 2026-09-15) could not recover when a
+    # committed segment ENDED in an unrecoverable state -- circular_cross_4 committed four
+    # robots arriving at speed at their shared centre milestone.
+    adapt_max: 1
+    # Planning time budget in seconds for the WHOLE instance. Checked between rungs, rounds
+    # and segments, so the overshoot is one solver call. On expiry every robot brakes to rest
+    # and the run reports `timed_out=1` with the remaining segments counted unsolved -- a
+    # timeout is a FAILURE, not a slow success, and must be reported as one. null disables it.
+    #
+    # K-ARC's own setup (SS V) gives every method 600 s, but that is C++ in the Parasol
+    # Planning Library on a 32-core machine; this is Python driving IPOPT through CasADi, so
+    # 600 s here buys a small fraction of the same search and is not the same experiment.
+    # Holding to it was actively misleading: at N=32 EVERY arm we ran -- baseline, detune,
+    # speed assignment, multi-disc -- ended with rounds=1, meaning none of them completed a
+    # single resolution round, so `conflicts_remaining` measured how far each got before the
+    # clock stopped rather than how well it resolved, and no two arms were comparable.
+    # 1800 s is the working budget: enough to finish a round at N=32, and still a bound.
+    # Wall times remain incomparable to the paper's either way; correctness first.
+    timeout: 1800.0
+    # What to do when a segment's subproblem is never resolved (or the budget expires).
+    #   return_empty - K-ARC's Alg. 1 lines 26-27: `return ∅`. The WHOLE instance fails and
+    #                  no plan is emitted, so nothing moves. K-ARC never returns a plan with
+    #                  a conflict left in it, and executing the segments that did solve
+    #                  measures something the algorithm would not have produced.
+    #   brake        - commit the solved segments and bring everyone to rest at the failure.
+    #                  Not K-ARC; useful for rendering WHERE a run fails, which `return_empty`
+    #                  by construction cannot show.
+    on_unsolved: return_empty
+    # Which rung of the ladder a subproblem STARTS at. NOVELTY -- not in K-ARC.
+    #   sequential - K-ARC's own behaviour: always start at rung 0 and pay for every cheaper
+    #                rung before discovering a conflict was severe.
+    #   margin     - predict the rung from what the prioritized rung can EXPRESS. Its only
+    #                concession is waiting, so simulate it: brake one robot to rest and check
+    #                whether that separates the pair. If not, someone has to leave the path
+    #                and only a sampling rung can do that. provable_ics goes straight to the
+    #                strongest rung. The rungs AFTER the chosen one remain as fallback, so
+    #                this can skip work it predicts is wasted but can never lose a resolution
+    #                the sequential ladder would have found.
+    # Worth something only because the rungs differ in cost by orders of magnitude: on
+    # open_cross_4 the prioritized rung resolves in seconds where composite RRT takes minutes.
+    rung_select: sequential
+    # Cap on resolution rounds per segment before the segment is committed as-is.
+    max_rounds: 3
+    # Priority order within a subproblem: index (agent order) or distance
+    # (closest-to-goal first).
+    priority: index
+    # Keep every intermediate stage of the plan (reference paths, the uncoordinated
+    # solve, the conflicts it produced, what each rung changed) so scripts/karc_trace_gif.py
+    # can draw the planning PROCESS. Off by default: it holds the whole trajectory history
+    # in memory, which at N=32 is not free.
+    trace: false
+    # Terminal tolerance granted to lower-priority robots, in multiples of
+    # trajopt.goal_tol, per priority level. 1.0 makes the `relaxed_goal` rung a
+    # no-op (identical to `prioritized`), so it must exceed 1 to do anything.
+    relax_per_level: 3.0
+
+  # `optimization` (prioritised one-shot trajopt, K-ARC's first ladder rung)
+  # takes all of its settings from `trajopt` above and needs no block.
+  cegar:
+    seed: 0
+    # Candidate paths come from the same geometric sampler as `constructive`, with its own
+    # keys on purpose -- a shared knob is a shared method.
+    guide_rrt_iters: 5000
+    guide_rrt_step: 0.6
+    guide_rrt_goal_bias: 0.1
+    guide_rrt_shortcut: true
+    # Blur length in metres for the flat curve fit; see `constructive.smooth`. The
+    # sampled path's corners are rounded as hard as `blur_cap` allows before it is driven,
+    # because a kink in a polyline caps the cornering speed for the whole traverse:
+    # open_cross_32 is 701 steps driving the polyline as sampled and 516 with the corners
+    # rounded.
+    smooth: 0.12
+    # How far the rounded curve may leave the sampled path, as a fraction of a body width
+    # plus clearance. The bound is what keeps rounding from cutting a corner into a pillar
+    # -- and it is checked against the obstacles as well, not only measured.
+    blur_cap: 0.5
+    # What a path offers besides itself: the same geometry traversed slower, and the same
+    # geometry with a stop part-way along. Waiting EN ROUTE rather than on the start line
+    # is the point -- a robot parked on its start is a coordination device that only a
+    # planner owning the whole world can use.
+    slow: 1.6
+    waits: [30, 80]        # hold, in steps, at a sampled point along the path
+    long_wait: 200         # the wait offered to a robot the unsat core has named
+    # How many resample-and-retry rounds before giving up, and the wall-clock budget for
+    # the whole loop. `timeout` is meant to be the binding one: a round is cheap (16 of
+    # them solve cluttered_cross_32 in 114 s) and stopping at a round count throws away a
+    # loop that was still making progress -- at 8 rounds that scenario reports UNSAT after
+    # 5.7 s of a 1200 s budget.
+    rounds: 60
+    timeout: 600
+    trace: false
+    # How a sampled path becomes a candidate motion.
+    #   smooth  -- blur the corners, speed-profile the curve, track it (flat.py)
+    #   legs    -- stop, turn on the spot, drive each segment (the ablation)
+    #   trajopt -- hand the path to the trajectory optimiser K-ARC uses (trajopt.py) as a
+    #              seed, on the env's own time step, so the plan IS what the env executes.
+    #              Candidates are a fast and a slow solve per guide; an unsat core's
+    #              repair re-solves a named robot from shortly before it met the robot it
+    #              was refuted against, keeping clear of that robot, on both sides.
+    drive: trajopt
+    horizon_slack: [1.3, 1.6]   # x straight-line rest-to-rest time along the guide
+    repair_slack: 1.2           # extra time a sidestep may take; 1.0 never solved
+    yield_back: 30              # steps before first contact the re-solve starts from
+    back_doublings: 2           # if no side converges, start 2x, then 4x further back
+    yield_keys: 1               # core refutations each blamed robot gets a yield for
+    repair_from: core           # core | conflicts (ablation: repair every robot in any known conflict)
+    effort_weight: 0.01         # weight of sum ||u||^2 in the trajopt cost; 0 = feasibility only (ablation)
+    # Ablation switches (defaults = K-REF as in the paper):
+    select: sat                 # sat | greedy (prioritized selection in robot order)
+    eager: false                # true: check every candidate pair up front, not on demand
+    core_minimize: false        # true: z3 shrinks the refutation to a minimal one
+    forget: false               # true: drop the learned conflicts after each repair
+    yield_who: both             # both | random (one robot of each refuted pair yields)
+    sidestep: 0.9               # metres the re-solve's seed is pushed aside at contact
+    body_discs: 3               # discs covering the body in the keep-clear constraint
+    goal_tol: 0.15
+    obstacle_margin: 4.0
+    max_iter: 1000
+    workers: 4                  # solve processes; IPOPT holds ~0.5-1.5 GB each
+
+  # ── Core-guided B-spline coordination (OURS, the spline one) ───────────────────
+  # Selected with `approach.method=splinecegar`. Same reasoning as `cegar:` above --
+  # lazy SMT over candidate motions, unsat cores to say who is stuck -- with the geometry
+  # layer replaced: a candidate IS a cubic B-spline, so smoothness is the basis rather
+  # than a blur, curvature is analytic rather than finite-differenced, and repair is a
+  # displacement of the two or three control points nearest the contested point, which
+  # local support guarantees changes nothing else on the curve.
+  kcbs:
+    binary: ~/kcbs_bench/build/main_kcbs
+    seed: 0
+    timeout: 600
+    ll_timelimit: 1.0
+    control_duration: [1, 10]
+    clearance: 0.05

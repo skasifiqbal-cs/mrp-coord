@@ -1,0 +1,6 @@
+# @package shaping
+type: dubins
+gamma: 1.0   # undiscounted: F=phi(s)-phi(s) -> reward for PROGRESS, idle=0 (avoids discount-bleed idle reward)
+min_turning_radius: null  # null -> auto-derive rho = v_max / omega_max from the robot.
+                          # Keeps Dubins turning radius consistent with the actual
+                          # dynamics, and makes the E2 omega-sweep update rho for free.

@@ -1,0 +1,94 @@
+--- a/src/main_kcbs.cpp
++++ b/src/main_kcbs.cpp
+@@ -67,6 +67,8 @@
+ #include "fclStateValidityChecker.hpp"
+ 
+ 
++#include <ompl/util/RandomNumbers.h>
++
+ namespace omrb = ompl::multirobot::base;
+ namespace omrc = ompl::multirobot::control;
+ namespace ob = ompl::base;
+@@ -85,6 +87,33 @@
+         else
+             return std::make_pair(nullptr, nullptr);
+     }
++};
++
++// the simulator's goal test: centre within goal_radius of the goal position and, for a
++// robot with a speed state, |v| below stop_speed. Heading is not part of the goal.
++class PositionGoal : public ob::GoalRegion
++{
++public:
++    PositionGoal(const ob::SpaceInformationPtr &si, std::shared_ptr<Robot> robot,
++                 double gx, double gy, double radius, double stop_speed)
++      : ob::GoalRegion(si), robot_(robot), gx_(gx), gy_(gy), stop_speed_(stop_speed)
++    {
++        setThreshold(radius);
++    }
++    double distanceGoal(const ob::State *st) const override
++    {
++        const auto p = robot_->getTransform(st, 0).translation();
++        double d = std::hypot(p(0) - gx_, p(1) - gy_);
++        std::vector<double> reals;
++        si_->getStateSpace()->copyToReals(reals, st);
++        // Outside the radius when too fast, so isSatisfied (distance <= threshold) is the env's test.
++        if (reals.size() > 3 && std::fabs(reals[3]) >= stop_speed_)
++            d = std::max(d, threshold_ + std::fabs(reals[3]) - stop_speed_ + 1e-3);
++        return d;
++    }
++private:
++    std::shared_ptr<Robot> robot_;
++    double gx_, gy_, stop_speed_;
+ };
+ 
+ ompl::base::PlannerPtr PlannerAllocator(const ompl::base::SpaceInformationPtr &si)
+@@ -132,12 +161,11 @@
+             other_robot_co.setRotation(transform.rotation());
+             other_robot_co.computeAABB();
+ 
+-            fcl::DefaultCollisionData<float> collision_data;
+-            fcl::CollisionRequest<float> request;
+-            fcl::CollisionResult<float> result;
+-            // collide(robot_co, other_robot_co, &collision_data, fcl::DefaultCollisionFunction<float>);
+-            collide(&robot_co, &other_robot_co, request, result);
+-            if (result.isCollision()) { //collision_data.
++            // Robot-robot clearance, as in the simulator (distance >= clearance, not mere contact).
++            fcl::DistanceRequest<float> request;
++            fcl::DistanceResult<float> result;
++            fcl::distance(&robot_co, &other_robot_co, request, result);
++            if (result.min_distance < clearance_) {
+                 return false;
+             }
+         } else {
+@@ -147,6 +175,7 @@
+ 
+         return true;
+     }
++    static inline float clearance_ = 0.05f;
+ private:
+     std::map<const ompl::base::SpaceInformationPtr, std::shared_ptr<Robot>> all_robots_;
+ };
+@@ -220,6 +249,8 @@
+     std::vector<double> start_reals;
+     std::vector<double> goal_reals;
+     YAML::Node cfg = YAML::LoadFile(cfgFile);
++  if (cfg["clearance"]) multiRobotFclStateValidityChecker::clearance_ = cfg["clearance"].as<float>();
++  if (cfg["seed"]) ompl::RNG::setSeed(cfg["seed"].as<unsigned long>());
+     auto ma_si(std::make_shared<omrc::SpaceInformation>());
+     auto ma_pdef(std::make_shared<omrb::ProblemDefinition>(ma_si));
+     for (const auto &robot_node : env["robots"]) {
+@@ -263,11 +294,8 @@
+         si->freeState(startState);
+         start_reals.clear();
+          // set goal state
+-        auto goalState = si->allocState();
+-        si->getStateSpace()->copyFromReals(goalState, goal_reals);
+-        si->enforceBounds(goalState);
+-        pdef->setGoalState(goalState, cfg["goal_epsilon"].as<double>());
+-        si->freeState(goalState);
++        pdef->setGoal(std::make_shared<PositionGoal>(si, robot, goal_reals[0], goal_reals[1],
++            cfg["goal_epsilon"].as<double>(), cfg["stop_speed"].as<double>()));
+         goal_reals.clear();
+ 
+         ma_si->addIndividual(si);

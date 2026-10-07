@@ -1,0 +1,15 @@
+# K-REF and its baselines. Pick the planner and the scenario here, or on the command line:
+#   python main.py approach.method=cegar env=open_cross_8_unicycle2
+defaults:
+  - approach: planning   # conf/approach/planning.yaml
+  - env: open_cross_8_unicycle2   # conf/env/*.yaml
+  - shaping: euclidean   # unused by the planners; the env factory builds it
+  - obs: full_state      # unused by the planners; the env factory builds it
+  - init: fixed          # the scenario's own start and goal states
+  - _self_
+
+eval:
+  checkpoint: null
+  episodes: 1
+  gif_path: episode.gif
+  fps: 15
