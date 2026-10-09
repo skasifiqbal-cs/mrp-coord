@@ -420,7 +420,7 @@ approach:
   # displacement of the two or three control points nearest the contested point, which
   # local support guarantees changes nothing else on the curve.
   kcbs:
-    binary: ~/kcbs_bench/build/main_kcbs
+    binary: baselines/kcbs/build/main_kcbs
     seed: 0
     timeout: 600
     ll_timelimit: 1.0
